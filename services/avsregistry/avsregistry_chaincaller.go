@@ -3,9 +3,11 @@ package avsregistry
 import (
 	"context"
 	"fmt"
+	"math/big"
+	"sync"
+
 	opstateretriever "github.com/Layr-Labs/eigensdk-go/contracts/bindings/OperatorStateRetriever"
 	"github.com/ethereum/go-ethereum/common"
-	"math/big"
 
 	"github.com/Layr-Labs/eigensdk-go/crypto/bls"
 	"github.com/Layr-Labs/eigensdk-go/logging"
@@ -65,26 +67,46 @@ func (ar *AvsRegistryServiceChainCaller) GetOperatorsAvsStateAtBlock(ctx context
 		ar.logger.Fatal("Number of quorums returned from GetOperatorsStakeInQuorumsAtBlock does not match number of quorums requested. Probably pointing to old contract or wrong implementation.", "service", "AvsRegistryServiceChainCaller")
 	}
 
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	errChan := make(chan error, len(quorumNumbers)*len(operatorsStakesInQuorums)) // buffer to capture potential errors
+
 	for quorumIdx, quorumNum := range quorumNumbers {
 		for _, operator := range operatorsStakesInQuorums[quorumIdx] {
-			info, err := ar.getOperatorInfo(ctx, operator.OperatorId)
-			if err != nil {
-				return nil, utils.WrapError("Failed to find pubkeys for operator while building operatorsAvsState", err)
-			}
-			if operatorAvsState, ok := operatorsAvsState[operator.OperatorId]; ok {
-				operatorAvsState.StakePerQuorum[quorumNum] = operator.Stake
-			} else {
-				stakePerQuorum := make(map[types.QuorumNum]types.StakeAmount)
-				stakePerQuorum[quorumNum] = operator.Stake
-				operatorsAvsState[operator.OperatorId] = types.OperatorAvsState{
-					OperatorId:     operator.OperatorId,
-					OperatorInfo:   info,
-					StakePerQuorum: stakePerQuorum,
-					BlockNumber:    blockNumber,
+			wg.Add(1)
+			go func(operator opstateretriever.OperatorStateRetrieverOperator, quorumNum types.QuorumNum) {
+				defer wg.Done()
+				info, err := ar.getOperatorInfo(ctx, operator.OperatorId)
+				if err != nil {
+					errChan <- utils.WrapError("Failed to find pubkeys for operator while building operatorsAvsState", err)
+					return
 				}
-				operatorsAvsState[operator.OperatorId].StakePerQuorum[quorumNum] = operator.Stake
-			}
+
+				mu.Lock()
+				defer mu.Unlock()
+				if operatorAvsState, ok := operatorsAvsState[operator.OperatorId]; ok {
+					operatorAvsState.StakePerQuorum[quorumNum] = operator.Stake
+				} else {
+					stakePerQuorum := make(map[types.QuorumNum]types.StakeAmount)
+					stakePerQuorum[quorumNum] = operator.Stake
+					operatorsAvsState[operator.OperatorId] = types.OperatorAvsState{
+						OperatorId:     operator.OperatorId,
+						OperatorInfo:   info,
+						StakePerQuorum: stakePerQuorum,
+						BlockNumber:    blockNumber,
+					}
+					operatorsAvsState[operator.OperatorId].StakePerQuorum[quorumNum] = operator.Stake
+				}
+			}(operator, quorumNum)
 		}
+	}
+
+	wg.Wait()
+	close(errChan)
+
+	// check if any errors were captured
+	if len(errChan) > 0 {
+		return nil, <-errChan
 	}
 
 	return operatorsAvsState, nil
